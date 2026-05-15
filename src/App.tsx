@@ -1,5 +1,11 @@
 import { useState, useEffect, useRef, ChangeEvent, KeyboardEvent } from "react";
-import { supabase, setupPresence } from "./supabase";
+import type { User as SupabaseUser } from "@supabase/supabase-js";
+import {
+  supabase,
+  setupPresence,
+  upsertPlayerProfile,
+  signOutSupabase,
+} from "./supabase";
 import { askChatAi, isApiConfigured, getAiProviderName } from "./groq";
 import {
   FILES,
@@ -180,7 +186,12 @@ export default function App() {
   const [introStep, setIntroStep] = useState(0);
 
   // --- Login & Tutorial State ---
-  const [inputName, setInputName] = useState("");
+  const [authMode, setAuthMode] = useState<"login" | "signup">("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authMessage, setAuthMessage] = useState<string | null>(null);
   const [tutorialStep, setTutorialStep] = useState(1);
 
   // --- Game State ---
@@ -677,13 +688,12 @@ export default function App() {
     });
   };
 
-  const handleLogin = async (id: string, name: string) => {
-    setUser({ id, name });
-    localStorage.setItem("ghostwire_id", id);
-    localStorage.setItem("ghostwire_name", name);
-    await setupPresence(id, name);
+  const handleAuthSuccess = async (authUser: SupabaseUser, name: string) => {
+    setUser({ id: authUser.id, name });
+    await upsertPlayerProfile(authUser.id, name);
+    await setupPresence(authUser.id, name);
     unlockAchievement("first_login");
-    const restored = await fetchSavedState(id);
+    const restored = await fetchSavedState(authUser.id);
     if (restored) {
       setPendingSavedState(restored);
       setResumeAvailable(true);
@@ -691,11 +701,113 @@ export default function App() {
         `[SYSTEM] Sesi sebelumnya ditemukan. Setelah tutorial, kamu bisa tekan Resume untuk lanjut atau Restart untuk mulai ulang.`,
         "system",
       );
-      startIntro();
-      return;
     }
     startIntro();
   };
+
+  const getAuthErrorMessage = (message: string) => {
+    const lower = message.toLowerCase();
+    if (lower.includes("email rate limit")) {
+      return (
+        "Pengiriman email terbatasi. Coba lagi nanti atau atur SMTP Brevo di " +
+        "Supabase Authentication > Email agar verifikasi bisa terkirim."
+      );
+    }
+    if (lower.includes("invalid email")) {
+      return "Alamat email tidak valid. Gunakan email asli yang benar.";
+    }
+    return message;
+  };
+
+  const handleAuthSubmit = async () => {
+    if (!supabase) {
+      setAuthError("Supabase tidak terkonfigurasi.");
+      return;
+    }
+    setAuthError(null);
+    setAuthMessage(null);
+
+    if (authMode === "signup") {
+      if (!email || !password || !displayName) {
+        setAuthError("Lengkapi email, password, dan nama operator.");
+        return;
+      }
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: { name: displayName },
+        },
+      });
+      if (error) {
+        setAuthError(getAuthErrorMessage(error.message));
+        return;
+      }
+      if (data.session?.user) {
+        await handleAuthSuccess(data.session.user, displayName);
+        return;
+      }
+      setAuthMessage(
+        `Akun dibuat. Kami telah mengirim email konfirmasi ke ${email}. Silakan buka inbox dan klik tautan verifikasi sebelum masuk kembali.`,
+      );
+      return;
+    }
+
+    if (!email || !password) {
+      setAuthError("Isi email dan password untuk masuk.");
+      return;
+    }
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+    if (error) {
+      setAuthError(getAuthErrorMessage(error.message));
+      return;
+    }
+    if (data.user) {
+      const name =
+        data.user.user_metadata?.name ||
+        data.user.email?.split("@")[0] ||
+        "Operator";
+      await handleAuthSuccess(data.user, name);
+      return;
+    }
+    setAuthError("Gagal login. Coba lagi.");
+  };
+
+  const handleLogout = async () => {
+    await signOutSupabase();
+    setUser(null);
+    setCurrentPage("login");
+    setAuthMode("login");
+    setEmail("");
+    setPassword("");
+    setDisplayName("");
+    setAuthError(null);
+  };
+
+  useEffect(() => {
+    if (!supabase) return;
+
+    const initAuth = async () => {
+      const { data, error } = await supabase.auth.getSession();
+      if (error) {
+        console.warn("Auth session error", error);
+        return;
+      }
+      if (data.session?.user) {
+        const authUser = data.session.user;
+        const name =
+          authUser.user_metadata?.name ||
+          authUser.email?.split("@")[0] ||
+          "Operator";
+        await handleAuthSuccess(authUser, name);
+      }
+    };
+
+    initAuth();
+  }, []);
 
   const startGame = () => {
     if (!user?.id || !user?.name) {
@@ -1379,32 +1491,77 @@ export default function App() {
             </div>
             <div className="mb-8">
               <p className="text-cyber-muted mb-4 text-sm">
-                Enter Operator Credentials
+                Masuk atau daftar dengan email nyata. Untuk daftar, cek inbox
+                dan konfirmasi email sebelum masuk.
               </p>
+              <p className="text-cyber-muted mb-4 text-sm">
+                Jika verifikasi email gagal karena batas kirim, gunakan SMTP
+                Brevo di Supabase Authentication &gt; Email.
+              </p>
+              <div className="flex gap-2 justify-center mb-4">
+                <button
+                  className={`btn-cyber px-4 py-2 rounded-lg text-sm ${
+                    authMode === "login"
+                      ? "bg-cyber-cyan text-black"
+                      : "bg-cyber-dark/60"
+                  }`}
+                  onClick={() => setAuthMode("login")}
+                >
+                  Sign In
+                </button>
+                <button
+                  className={`btn-cyber px-4 py-2 rounded-lg text-sm ${
+                    authMode === "signup"
+                      ? "bg-cyber-cyan text-black"
+                      : "bg-cyber-dark/60"
+                  }`}
+                  onClick={() => setAuthMode("signup")}
+                >
+                  Sign Up
+                </button>
+              </div>
+              {authMode === "signup" && (
+                <input
+                  className="input-cyber w-full rounded-lg mb-4 py-3 px-4 text-lg"
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                  placeholder="Nama Operator"
+                  onKeyDown={(e) => e.key === "Enter" && handleAuthSubmit()}
+                  autoFocus
+                />
+              )}
               <input
                 className="input-cyber w-full rounded-lg mb-4 py-3 px-4 text-lg"
-                value={inputName}
-                onChange={(e) => setInputName(e.target.value)}
-                placeholder="OPERATOR_NAME"
-                onKeyDown={(e) =>
-                  e.key === "Enter" &&
-                  inputName.trim() &&
-                  handleLogin(crypto.randomUUID(), inputName.trim())
-                }
-                maxLength={16}
-                autoFocus
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="email@domain.com"
+                onKeyDown={(e) => e.key === "Enter" && handleAuthSubmit()}
               />
+              <input
+                className="input-cyber w-full rounded-lg mb-4 py-3 px-4 text-lg"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Password"
+                onKeyDown={(e) => e.key === "Enter" && handleAuthSubmit()}
+              />
+              {authError && (
+                <p className="text-red-400 text-sm mb-3">{authError}</p>
+              )}
+              {authMessage && (
+                <p className="text-green-400 text-sm mb-3">{authMessage}</p>
+              )}
               <button
                 className="btn-cyber w-full rounded-lg py-3 text-lg font-bold tracking-wide cursor-pointer active:scale-95 transition-transform"
-                onClick={() =>
-                  inputName.trim() &&
-                  handleLogin(crypto.randomUUID(), inputName.trim())
+                onClick={handleAuthSubmit}
+                disabled={
+                  !email.trim() ||
+                  !password.trim() ||
+                  (authMode === "signup" && !displayName.trim())
                 }
-                disabled={!inputName.trim()}
               >
-                {inputName.trim()
-                  ? ">> INITIATE CONNECTION <<"
-                  : "ENTER NAME TO BEGIN"}
+                {authMode === "signup" ? "DAFTAR & MULAI" : "MASUK & LANJUTKAN"}
               </button>
             </div>
             <div className="text-xs text-cyber-muted space-y-1 border-t border-cyber-purple/30 pt-4">
@@ -1750,6 +1907,12 @@ export default function App() {
             onClick={() => setCurrentPage("tutorial")}
           >
             ❓
+          </button>
+          <button
+            className="text-cyber-purple hover:text-cyber-cyan transition cursor-pointer"
+            onClick={handleLogout}
+          >
+            🔓 Logout
           </button>
         </div>
       </header>
